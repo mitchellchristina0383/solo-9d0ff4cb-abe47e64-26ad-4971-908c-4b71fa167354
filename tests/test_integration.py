@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -69,6 +70,26 @@ class Stack:
                     pass
 
 
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+async def wait_ports_free(ports: list[int], timeout: float = 30) -> None:
+    """等上一轮测试的进程真正释放端口，避免套件连跑时抢端口。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(_port_free(p) for p in ports):
+            return
+        await asyncio.sleep(0.2)
+    raise RuntimeError("ports still in use; a previous stack did not exit")
+
+
 async def wait_ready(client: httpx.AsyncClient, urls: list[str], timeout: float = 20) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -98,6 +119,7 @@ async def main() -> int:
         for suffix in ("", "-wal", "-shm"):
             Path(str(f) + suffix).unlink(missing_ok=True)
 
+    await wait_ports_free([8080, 8081, 8082])
     stack = Stack()
     base_env = {"SOURCE_DB": str(DATA / "source.db"), "CACHE_DB": str(DATA / "cache.db")}
     stack.start("source", 8080, base_env)

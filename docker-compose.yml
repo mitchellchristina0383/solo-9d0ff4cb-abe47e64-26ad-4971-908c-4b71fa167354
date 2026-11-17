@@ -18,7 +18,9 @@ services:
   # 缓存实例 1 与 2：共享同一个 SQLite 数据库卷（WAL 模式）
   cache1:
     build: .
-    command: uvicorn app.cache:app --host 0.0.0.0 --port 8081
+    # --timeout-graceful-shutdown 1：滚动重启时 1s 后取消在途回源，
+    # 触发取消路径立即释放回源资格，另一实例可马上接管。
+    command: uvicorn app.cache:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 1
     environment:
       CACHE_DB: /shared/cache.db
       SOURCE_BASE: http://source:8080
@@ -42,7 +44,9 @@ services:
 
   cache2:
     build: .
-    command: uvicorn app.cache:app --host 0.0.0.0 --port 8081
+    # --timeout-graceful-shutdown 1：滚动重启时 1s 后取消在途回源，
+    # 触发取消路径立即释放回源资格，另一实例可马上接管。
+    command: uvicorn app.cache:app --host 0.0.0.0 --port 8081 --timeout-graceful-shutdown 1
     environment:
       CACHE_DB: /shared/cache.db
       SOURCE_BASE: http://source:8080
@@ -54,7 +58,7 @@ services:
     volumes:
       - cache-shared:/shared
     ports:
-      - "8082:8081"
+      - "8082:8081"   # 容器内仍是 8081；宿主机 8082 对应 /docs 中的 cache2
     depends_on:
       source:
         condition: service_healthy

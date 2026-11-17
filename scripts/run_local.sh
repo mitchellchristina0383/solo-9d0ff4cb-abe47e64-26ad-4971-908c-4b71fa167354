@@ -26,11 +26,13 @@ SRC_PID=$!
 
 SOURCE_BASE="http://127.0.0.1:8080" INSTANCE_ID=cache1 \
 "$PY" -m uvicorn app.cache:app --host 127.0.0.1 --port 8081 \
+  --timeout-graceful-shutdown 1 \
   >"$LOG/cache1.log" 2>&1 &
 C1_PID=$!
 
 SOURCE_BASE="http://127.0.0.1:8080" INSTANCE_ID=cache2 \
 "$PY" -m uvicorn app.cache:app --host 127.0.0.1 --port 8082 \
+  --timeout-graceful-shutdown 1 \
   >"$LOG/cache2.log" 2>&1 &
 C2_PID=$!
 

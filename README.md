@@ -18,14 +18,15 @@
           │ app/cache.py       │   共享 SQLite   │ app/cache.py       │
           └─────────┬──────────┘  (WAL, 卷挂载)  └─────────┬──────────┘
                     └──────────────► cache.db ◄────────────┘
-                  表: snapshots(valid/stale) / inflight(租约) / failures(冷却)
+                  表: snapshots(valid/stale) / inflight(租约+围栏令牌) / failures(冷却)
 ```
 
 - **配置源** (`app/source.py`)：`POST /admin/publish` 每发一次，该服务 `revision + 1`；
   `GET /services/{s}/current` 返回当前修订（轻量、不受故障注入影响）；
   `GET /services/{s}/revisions/{r}` 返回指定修订全量节点（慢/错/挂起只作用在这里）。
 - **缓存实例** (`app/cache.py`)：两个实例共享一个 SQLite 文件，无独立缓存进程，
-  协调状态全部落在共享库的三张表里。
+  协调状态全部落在共享库的三张表里。`inflight` 除 leader 外还保存一次性
+  `lease_token`，作为接管后阻止旧任务写入的围栏。
 
 ## 关键保证与实现方式
 
@@ -37,19 +38,31 @@
    只有一个实例成为 leader 发起回源；其余实例轮询共享库，直接复用 leader 写入的快照
    （响应里 `coalesced=true`）。配置源 `/admin/metrics` 可核对实际回源次数。
 
-3. **leader 超时/退出后其他实例接手**
-   leader 每 0.7s 续租（TTL 2s）。回源有 6s 硬时限：超时即停心跳、释放租约并记录失败；
-   进程被 kill 时租约自然过期。follower 发现租约过期即接管。
-   等待中的 follower 在租约仍有效时不会被失败记录提前打回 503。
+3. **leader 超时、被取消或退出后其他实例接手**
+   leader 每 0.7s 续租（TTL 2s），租约带一次性围栏令牌 `lease_token`。
+   回源有 6s 硬时限：超时即停心跳、释放租约并记录失败；进程被 kill 时租约自然过期。
+   **请求被取消（客户端断开 / 调用方中断）时立即停心跳并释放回源资格**，
+   其他实例无需等 TTL 到期即可接管；接管成功的响应带 `served_by=<新回源实例>`
+   与 `takeover=true`。等待中的 follower 在租约仍有效时不会被失败记录提前打回 503。
+   滚动重启时 Compose 用 `--timeout-graceful-shutdown 1`：关闭钩子会取消在途回源，
+   同样走取消路径释放资格（实测 SIGTERM 后 ~1s 内另一实例即可接管）。
 
-4. **慢回源跨过修订更新，不把旧响应写成有效缓存**
+4. **接管后旧任务的迟到动作不生效（围栏）**
+   每次取得回源资格都会生成新的 `lease_token`；续租、写快照、写失败记录、释放租约
+   都必须同时匹配 `leader + lease_token`。请求被取消后留下的交接标记
+   （token 清空、立即过期）不阻止任何人接管，但旧任务此后的迟到结果/失败/清理
+   全部落空，不会覆盖新持有者的租约、失败状态与有效快照；迟到的 stale 结果
+   也不能把已有的 valid 快照降级。
+
+5. **慢回源跨过修订更新，不把旧响应写成有效缓存**
    回源返回后再次核对当前修订：若已推进，旧修订快照只写为 `status=stale`，
    本次请求返回 409 提示重试；后续查询走新修订。stale 快照保留供排障。
 
-5. **回源失败明确不可用，旧快照可排障**
-   回源失败统一 `503`，body 含 `reason` 与 `last_good`（最近一次有效快照）；
-   失败有 3s 冷却（共享，两个实例都快速失败，避免雪崩），冷却过后自动重试。
-   `GET /snapshots/{service}` 与 `/snapshots/{service}/revisions/{r}` 在源故障期间仍可读。
+6. **回源失败明确不可用，旧快照可排障**
+   已确认修订但全量回源失败时统一 `503`，body 含 `reason` 与 `last_good`
+   （最近一次有效快照）；失败有 3s 冷却（共享，两个实例都快速失败，避免雪崩），
+   冷却过后自动重试。`GET /snapshots/{service}` 与
+   `/snapshots/{service}/revisions/{r}` 在源故障期间仍可读。
    源整体宕机时，已有有效快照的服务降级返回（`degraded=true`），无快照才 503。
 
 ## 运行
@@ -80,13 +93,26 @@ bash scripts/run_local.sh
 2. cache `/docs` → `GET /routes/payments` 查询，观察 `revision / nodes / from_cache / served_by`
 3. source → `POST /admin/fault` 设 `{"mode":"delay","delay":2}` 模拟慢响应；
    `error` 模拟 5xx；`hang` 模拟挂起；`ok` 恢复
-4. cache → `GET /debug/state` 看 inflight 租约、failures 冷却、snapshots 状态
+4. cache → `GET /debug/state` 看 inflight 租约（含 `lease_token` 短指纹）、failures 冷却、snapshots 状态
 5. cache → `GET /snapshots/payments` 看全部历史快照（含 stale）
+
+### 在 /docs 复现取消后的跨实例接管
+
+1. source 故障注入 `{"mode":"delay","delay":2}`，并 `POST /admin/publish` 出一个新修订
+2. cache1 `/docs` → `GET /routes/payments`，参数 `cancel_after=0.5`
+   → 约 0.5s 后返回 409 `query cancelled ... lease released`，回源资格立即让出
+3. 立刻在 cache2 `/docs` → `GET /routes/payments`
+   → 200，`served_by=cache2`、`takeover=true`、`from_cache=false`（约 1–2s 内完成，
+   不需要等 2s 租约过期）
+4. 任意 cache → `GET /debug/state`：无带令牌的有效租约；取消者没有写入失败记录
+5. 想验证"迟到结果不覆盖"：把 delay 调到 3s 并在步骤 2 用 `cancel_after=0.5`，
+   接管完成后 `GET /snapshots/payments`，该修订仍是接管者写入的 `valid` 快照
 
 ## 自测
 
 ```bash
 .venv/bin/python -I tests/test_integration.py   # 13 项：修订一致性/并发合并/接管/跨修订/故障
+.venv/bin/python -I tests/test_cancel.py        # 8 项：取消/接管交错、围栏、断连、失败不可用
 .venv/bin/python -I tests/test_edge.py          # 边界：源宕机降级、404、发布交错单调性
 ```
 

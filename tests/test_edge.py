@@ -2,6 +2,7 @@
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -13,6 +14,24 @@ ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv" / "bin" / "python")
 DATA = ROOT / "data"
 SRC, C1, C2 = "http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://127.0.0.1:8082"
+
+
+async def wait_ports_free(ports: list[int], timeout: float = 30) -> None:
+    """等上一轮测试的进程真正释放端口，避免套件连跑时抢端口。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        free = True
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    s.bind(("127.0.0.1", port))
+                except OSError:
+                    free = False
+        if free:
+            return
+        await asyncio.sleep(0.2)
+    raise RuntimeError("ports still in use; a previous stack did not exit")
 
 
 async def main():
@@ -31,6 +50,7 @@ async def main():
     for f in (DATA / "edge_source.db", DATA / "edge_cache.db"):
         for s in ("", "-wal", "-shm"):
             Path(str(f) + s).unlink(missing_ok=True)
+    await wait_ports_free([8080, 8081, 8082])
     src = start("source", 8080, base)
     start("cache", 8081, {**base, "SOURCE_BASE": SRC, "INSTANCE_ID": "cache1"})
     start("cache", 8082, {**base, "SOURCE_BASE": SRC, "INSTANCE_ID": "cache2"})
